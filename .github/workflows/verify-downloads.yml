@@ -1,0 +1,39 @@
+name: Anonymous release delivery verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Compare anonymous public paths from an independent hosted runner
+        shell: python
+        run: |
+          import hashlib, json, pathlib, subprocess, urllib.request, urllib.parse
+          base = 'https://flats-site.tail2511fc.ts.net'
+          manifest = json.load(urllib.request.urlopen(base+'/data/releases.json', timeout=30))
+          item = next(x for x in manifest['artifacts'] if x['publication']=='approved' and x['platform']=='Windows')
+          name = item['filename']
+          assert '/' not in name and '\\' not in name and '..' not in name
+          urls = {'funnel': base+'/downloads/'+name,
+                  'release': 'https://github.com/ken5170696/flats-downloads/releases/download/v'+item['version']+'/'+name}
+          rows=[]
+          for trial in range(2):
+            for label in (['funnel','release'] if trial==0 else ['release','funnel']):
+              path=pathlib.Path(label+'.zip')
+              headers=pathlib.Path(label+'.headers')
+              result=subprocess.run(['curl','--noproxy','*','--fail','--silent','--show-error','--location','--max-time','150',
+                                     '--dump-header',str(headers),'--output',str(path),'--write-out','%{json}',urls[label]],capture_output=True,text=True)
+              data=json.loads(result.stdout)
+              row={k:data.get(k) for k in ['http_code','size_download','time_total','speed_download','remote_ip','num_redirects']}
+              row.update(trial=trial+1,path=label,exitCode=result.returncode,finalHost=urllib.parse.urlsplit(data.get('url_effective','')).hostname,
+                         cache=[line for line in headers.read_text().splitlines() if line.lower().startswith(('age:','x-cache:','cache-control:'))])
+              if path.exists():
+                with path.open('rb') as stream: row['sha256']=hashlib.file_digest(stream,'sha256').hexdigest()
+                row['integrity']=path.stat().st_size==item['bytes'] and row['sha256']==item['sha256']
+              rows.append(row)
+              print('DELIVERY_RESULT '+json.dumps(row),flush=True)
+          print('SOURCE: standard GitHub-hosted Ubuntu runner, no Tailscale, anonymous HTTP; location not independently geolocated.')
+          assert all(row.get('integrity') and row['exitCode']==0 for row in rows)
