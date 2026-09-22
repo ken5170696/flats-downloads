@@ -1,6 +1,11 @@
 name: Anonymous release delivery verification
 on:
   workflow_dispatch:
+    inputs:
+      compare_legacy:
+        description: Also measure the retained Funnel URL (may take 5 minutes)
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -10,8 +15,10 @@ jobs:
     steps:
       - name: Compare anonymous public paths from an independent hosted runner
         shell: python
+        env:
+          COMPARE_LEGACY: ${{ inputs.compare_legacy }}
         run: |
-          import hashlib, json, pathlib, subprocess, urllib.request, urllib.parse
+          import hashlib, json, pathlib, subprocess, urllib.request, urllib.parse, os
           base = 'https://flats-site.tail2511fc.ts.net'
           manifest = json.load(urllib.request.urlopen(base+'/data/releases.json', timeout=30))
           item = next(x for x in manifest['artifacts'] if x['publication']=='approved' and x['platform']=='Windows')
@@ -21,7 +28,8 @@ jobs:
                   'release': 'https://github.com/ken5170696/flats-downloads/releases/download/v'+item['version']+'/'+name}
           rows=[]
           for trial in range(2):
-            for label in (['funnel','release'] if trial==0 else ['release','funnel']):
+            labels = (['funnel','release'] if trial==0 else ['release','funnel']) if os.environ.get('COMPARE_LEGACY')=='true' else ['release']
+            for label in labels:
               path=pathlib.Path(label+'.zip')
               headers=pathlib.Path(label+'.headers')
               result=subprocess.run(['curl','--noproxy','*','--fail','--silent','--show-error','--location','--max-time','150',
@@ -38,3 +46,34 @@ jobs:
           print('SOURCE: standard GitHub-hosted Ubuntu runner, no Tailscale, anonymous HTTP; location not independently geolocated.')
           # An old Funnel timeout is useful baseline evidence, not a CDN release failure.
           assert all(row.get('integrity') and row['exitCode']==0 for row in rows if row['path']=='release')
+      - name: Install pinned browser test client
+        run: npm install --no-save --ignore-scripts playwright@1.62.1
+      - name: Download from the production page in an anonymous browser
+        run: |
+          node --input-type=module <<'JS'
+          import {chromium} from 'playwright';
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          const browser=await chromium.launch({channel:'chrome',headless:true});
+          try {
+            const context=await browser.newContext({acceptDownloads:true});
+            const page=await context.newPage();
+            const base='https://flats-site.tail2511fc.ts.net';
+            const item=(await (await context.request.get(base+'/data/releases.json')).json()).artifacts.find(x=>x.publication==='approved');
+            await page.goto(base+'/downloads?lang=en');
+            const link=page.locator('.release .button').first();
+            await link.waitFor();
+            assert.equal(await link.getAttribute('href'),item.url);
+            assert.ok(item.url.startsWith('https://github.com/ken5170696/flats-downloads/releases/download/'));
+            const pending=page.waitForEvent('download'); const start=Date.now();
+            await link.click(); const download=await pending;
+            assert.equal(download.suggestedFilename(),item.filename);
+            await download.saveAs('browser.zip');
+            const seconds=(Date.now()-start)/1000;
+            const bytes=fs.readFileSync('browser.zip');
+            const sha256=crypto.createHash('sha256').update(bytes).digest('hex');
+            assert.equal(bytes.length,item.bytes);assert.equal(sha256,item.sha256);
+            console.log('BROWSER_RESULT '+JSON.stringify({status:'PASS',source:'Independent GitHub-hosted Ubuntu, fresh Chrome context, anonymous production page click',filename:item.filename,bytes:bytes.length,sha256,seconds}));
+          } finally {await browser.close();}
+          JS
