@@ -21,31 +21,27 @@ jobs:
           import hashlib, json, pathlib, subprocess, urllib.request, urllib.parse, os
           base = 'https://flats-site.tail2511fc.ts.net'
           manifest = json.load(urllib.request.urlopen(base+'/data/releases.json', timeout=30))
-          item = next(x for x in manifest['artifacts'] if x['publication']=='approved' and x['platform']=='Windows')
-          name = item['filename']
-          assert '/' not in name and '\\' not in name and '..' not in name
-          urls = {'funnel': base+'/downloads/'+name,
-                  'release': 'https://github.com/ken5170696/flats-downloads/releases/download/v'+item['version']+'/'+name}
-          rows=[]
-          for trial in range(2):
-            labels = (['funnel','release'] if trial==0 else ['release','funnel']) if os.environ.get('COMPARE_LEGACY')=='true' else ['release']
-            for label in labels:
-              path=pathlib.Path(label+'.zip')
-              headers=pathlib.Path(label+'.headers')
-              result=subprocess.run(['curl','--noproxy','*','--fail','--silent','--show-error','--location','--max-time','150',
-                                     '--dump-header',str(headers),'--output',str(path),'--write-out','%{json}',urls[label]],capture_output=True,text=True)
+          from concurrent.futures import ThreadPoolExecutor
+          items = [x for x in manifest['artifacts'] if x['publication']=='approved']
+          def verify(item):
+              name=item['filename']
+              assert '/' not in name and '\\' not in name and '..' not in name
+              url='https://github.com/ken5170696/flats-downloads/releases/download/v'+item['version']+'/'+name
+              assert item['url']==url
+              path=pathlib.Path(name)
+              result=subprocess.run(['curl','--noproxy','*','--fail','--silent','--show-error','--location','--max-time','180',
+                                     '--output',str(path),'--write-out','%{json}',url],capture_output=True,text=True)
               data=json.loads(result.stdout)
-              row={k:data.get(k) for k in ['http_code','size_download','time_total','speed_download','remote_ip','num_redirects']}
-              row.update(trial=trial+1,path=label,exitCode=result.returncode,finalHost=urllib.parse.urlsplit(data.get('url_effective','')).hostname,
-                         cache=[line for line in headers.read_text().splitlines() if line.lower().startswith(('age:','x-cache:','cache-control:'))])
-              if path.exists():
-                with path.open('rb') as stream: row['sha256']=hashlib.file_digest(stream,'sha256').hexdigest()
-                row['integrity']=path.stat().st_size==item['bytes'] and row['sha256']==item['sha256']
-              rows.append(row)
+              with path.open('rb') as stream: checksum=hashlib.file_digest(stream,'sha256').hexdigest()
+              row=dict(platform=item['platform'],filename=name,url=url,bytes=path.stat().st_size,sha256=checksum,
+                       sourceCommit=item['sourceCommit'],httpStatus=data.get('http_code'),seconds=data.get('time_total'),exitCode=result.returncode,
+                       integrity=path.stat().st_size==item['bytes'] and checksum==item['sha256'])
               print('DELIVERY_RESULT '+json.dumps(row),flush=True)
-          print('SOURCE: standard GitHub-hosted Ubuntu runner, no Tailscale, anonymous HTTP; location not independently geolocated.')
-          # An old Funnel timeout is useful baseline evidence, not a CDN release failure.
-          assert all(row.get('integrity') and row['exitCode']==0 for row in rows if row['path']=='release')
+              assert row['integrity'] and result.returncode==0 and row['httpStatus']==200
+              return row
+          with ThreadPoolExecutor(max_workers=4) as pool: rows=list(pool.map(verify,items))
+          assert len(rows)==len(items) and rows
+          print('SOURCE: standard GitHub-hosted Ubuntu runner, no Tailscale, anonymous full downloads; no game runtime.')
       - name: Install pinned browser test client
         run: npm install --no-save --ignore-scripts playwright@1.62.1
       - name: Download from the production page in an anonymous browser
